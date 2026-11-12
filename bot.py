@@ -172,12 +172,13 @@ def norm_room(room):
     return re.sub(r"[\s,;/]+", "/", room.lower()).strip("/")
 
 
-def merge(base_day, changes):
+def merge(base_day, changes, teachers=None):
     """Итоговое расписание: {урок: (предмет, кабинет, преподаватель, пометка)}; пометка: '' / 'new' / 'room' / 'cancel'."""
+    teachers = teachers or {}
     lessons = {}
     for k, v in base_day.items():
         if v:
-            lessons[int(k)] = (v[0], v[1], "", "")
+            lessons[int(k)] = (v[0], v[1], teachers.get(v[0], ""), "")
     for n, (subj, teacher, room) in changes.items():
         base = lessons.get(n)
         if subj and clean(subj).lower() in CANCEL_WORDS:
@@ -187,7 +188,7 @@ def merge(base_day, changes):
         elif room:
             if base and norm_room(room) == norm_room(base[1]):
                 continue  # в заменах просто продублирован тот же кабинет
-            lessons[n] = (base[0] if base else "?", room, teacher, "room")
+            lessons[n] = (base[0] if base else "?", room, teacher or (base[2] if base else ""), "room")
         elif teacher and base:
             lessons[n] = (base[0], base[1], teacher, "new")
     return dict(sorted(lessons.items()))
@@ -197,39 +198,61 @@ def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# Сокращения предметов: (часть названия в нижнем регистре, сокращение)
+SHORT_NAMES = [
+    ("алгоритмизац", "ОАиП"),
+    ("арифметико", "АЛОВТ"),
+]
+
+
+def short_name(name):
+    low = name.lower()
+    for key, short in SHORT_NAMES:
+        if key in low:
+            return short + (" (к.)" if "(к.)" in low else "")
+    return name
+
+
+def lesson_line(subj, room, teacher):
+    parts = [esc(short_name(subj))]
+    if room:
+        parts.append(esc(room))
+    if teacher:
+        parts.append(esc(teacher))
+    return " — ".join(parts)
+
+
 def build_message(day, merged, has_doc, update=False):
     head = f"{WEEKDAYS[day.weekday()]}, {day.day} {MONTHS_GEN[day.month]}"
     real = {n: v for n, v in merged.items() if v[3]}
+    lines = []
     if update:
-        title = f"🔁 <b>Замены обновились — {head}</b>"
-    else:
-        title = f"📅 <b>{head}</b> · {GROUP}"
-    lines = [title]
+        lines.append("<b>Замены обновились</b>")
+    lines.append(f"<b>{head}</b> — {GROUP}")
+    lines.append("")
 
     if not has_doc:
-        lines.append("ℹ️ Замены на этот день ещё не вывесили — это обычное расписание.")
+        lines.append("Замены ещё не вывесили, это обычное расписание.")
     elif real:
-        lines.append(f"⚠️ <b>Замен: {len(real)}</b>")
+        lines.append("<b>Замены:</b>")
         for n, (subj, room, teacher, mark) in real.items():
             if mark == "cancel":
-                lines.append(f"  {n} урок — ❌ снят ({esc(subj)})")
+                lines.append(f"{n} урок — {esc(short_name(subj))} (урок снят)")
             elif mark == "room":
-                lines.append(f"  {n} урок — кабинет → {esc(room)}")
+                lines.append(f"{n} урок — {esc(short_name(subj))}, кабинет {esc(room)}")
             else:
-                extra = ", ".join(x for x in (teacher, room) if x)
-                lines.append(f"  {n} урок — {esc(subj)}" + (f" ({esc(extra)})" if extra else ""))
+                lines.append(f"{n} урок — {lesson_line(subj, room, teacher)}")
     else:
-        lines.append("✅ Замен для группы нет.")
-
+        lines.append("Замен нет.")
     lines.append("")
+
     lines.append("<b>Расписание:</b>")
-    shown = {n: v for n, v in merged.items() if v[3] != "cancel"}
+    shown = [(n, v) for n, v in merged.items() if v[3] != "cancel"]
     if not shown:
-        lines.append("Занятий нет 🎉")
-    for n, (subj, room, teacher, mark) in shown.items():
-        icon = "✏️ " if mark else ""
-        room_txt = f" — {esc(room)}" if room else ""
-        lines.append(f"{n}. {icon}{esc(subj)}{room_txt}")
+        lines.append("Занятий нет.")
+    for n, (subj, room, teacher, mark) in shown:
+        text = lesson_line(subj, room, teacher)
+        lines.append(f"{n}. <b>{text}</b> (замена)" if mark else f"{n}. {text}")
     return "\n".join(lines)
 
 
@@ -260,7 +283,9 @@ def save_state(state, today):
 
 
 def check_once(dry=False, debug=False):
-    base = json.loads(BASE_FILE.read_text(encoding="utf-8"))["days"]
+    base_json = json.loads(BASE_FILE.read_text(encoding="utf-8"))
+    base = base_json["days"]
+    teachers = base_json.get("teachers", {})
     now = datetime.now(TZ)
     today = now.date()
     tomorrow = today + timedelta(days=1)
@@ -279,7 +304,7 @@ def check_once(dry=False, debug=False):
         if state["sent"].get(key) == digest:
             continue  # уже присылали ровно это
         update = key in state["sent"] or key in state["base_sent"]
-        merged = merge(base.get(str(d.isoweekday()), {}), changes)
+        merged = merge(base.get(str(d.isoweekday()), {}), changes, teachers)
         send(build_message(d, merged, has_doc=True, update=update), dry)
         state["sent"][key] = digest
 
@@ -287,7 +312,7 @@ def check_once(dry=False, debug=False):
     t_key = tomorrow.isoformat()
     if (now.hour >= EVENING_HOUR and tomorrow.weekday() != 6 and tomorrow not in seen_dates
             and t_key not in state["base_sent"] and t_key not in state["sent"]):
-        merged = merge(base.get(str(tomorrow.isoweekday()), {}), {})
+        merged = merge(base.get(str(tomorrow.isoweekday()), {}), {}, teachers)
         send(build_message(tomorrow, merged, has_doc=False), dry)
         state["base_sent"].append(t_key)
 
