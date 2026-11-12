@@ -1,0 +1,33 @@
+name: Замены расписания
+
+on:
+  schedule:
+    - cron: "*/15 3-20 * * *"   # каждые 15 минут с 6:00 до 23:45 по Минску
+  workflow_dispatch:            # кнопка «Run workflow» для ручного запуска
+
+permissions:
+  contents: write
+
+concurrency:
+  group: schedule-bot
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python bot.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - name: Сохранить, что уже отправлено
+        run: |
+          git config user.name "schedule-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "state" && git push)
+
